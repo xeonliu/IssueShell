@@ -11,6 +11,8 @@ The client runs arbitrary shell commands. Use a dedicated private repository and
 - A private GitHub repository
 - A fine-grained personal access token with `Metadata: read` and `Issues: read/write` for that repository
 
+IssueShell uses only the Go standard library. Building from this checkout does not download third-party Go modules.
+
 The server and client may use separate tokens. Tokens are read only from `GITHUB_TOKEN`; they are never written to an Issue or the local state database.
 
 ## Install
@@ -106,7 +108,7 @@ Closing the Issue directly has the same stop effect when the client next polls i
 - Commands are processed in Issue comment order, one at a time.
 - Client output is printed locally while the command runs, then uploaded after completion in approximately 48 KiB chunks.
 - Result manifests contain the command UUID, exit code, status, duration, chunk count, and SHA-256 hash.
-- Client state is stored in SQLite under `~/.issueshell` by default. Set `ISSUESHELL_STATE_DIR` or use `--state-dir` to change it.
+- Client state is stored as an atomically updated JSON file under `~/.issueshell` by default. Set `ISSUESHELL_STATE_DIR` or use `--state-dir` to change it.
 - Captured output is temporary and is deleted after the complete result is confirmed on GitHub.
 - If the client stops during execution, it uploads any retained partial output as `interrupted` after restart and never reruns the command automatically.
 - A canceled or unexpectedly exited shell is recreated. Its previous directory and environment state are necessarily lost.

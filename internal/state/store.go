@@ -1,15 +1,18 @@
+//go:build darwin || linux
+
 package state
 
 import (
-	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"sync"
+	"syscall"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 const (
@@ -17,124 +20,186 @@ const (
 	StatusCompleted   = "completed"
 	StatusCanceled    = "canceled"
 	StatusInterrupted = "interrupted"
+
+	stateVersion = 1
 )
 
 type Record struct {
-	Repo       string
-	Issue      int
-	CommandID  string
-	CommentID  int64
-	Status     string
-	OutputPath string
-	StartedAt  time.Time
+	Repo       string    `json:"repo"`
+	Issue      int       `json:"issue"`
+	CommandID  string    `json:"command_id"`
+	CommentID  int64     `json:"comment_id"`
+	Status     string    `json:"status"`
+	OutputPath string    `json:"output_path"`
+	StartedAt  time.Time `json:"started_at"`
+}
+
+type diskState struct {
+	Version  int               `json:"version"`
+	Commands map[string]Record `json:"commands"`
 }
 
 type Store struct {
-	db *sql.DB
+	mu       sync.Mutex
+	path     string
+	lockFile *os.File
+	state    diskState
 }
 
 func Open(directory string) (*Store, error) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, fmt.Errorf("create state directory: %w", err)
 	}
-	path := filepath.Join(directory, "state.sqlite3")
-	dsn := (&url.URL{Scheme: "file", Path: path}).String() + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
-	db, err := sql.Open("sqlite", dsn)
+	lockPath := filepath.Join(directory, "state.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open state lock: %w", err)
 	}
-	db.SetMaxOpenConns(1)
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("open state database: %w", err)
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lockFile.Close()
+		return nil, errors.New("state directory is already in use by another IssueShell client")
 	}
-	_ = os.Chmod(path, 0o600)
-	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS commands (
-			repo TEXT NOT NULL,
-			issue_number INTEGER NOT NULL,
-			command_id TEXT NOT NULL,
-			comment_id INTEGER NOT NULL,
-			status TEXT NOT NULL,
-			output_path TEXT NOT NULL,
-			started_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			PRIMARY KEY (repo, issue_number, command_id)
-		)`); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("initialize state database: %w", err)
+	store := &Store{
+		path:     filepath.Join(directory, "state.json"),
+		lockFile: lockFile,
+		state: diskState{
+			Version:  stateVersion,
+			Commands: make(map[string]Record),
+		},
 	}
-	return &Store{db: db}, nil
+	data, err := os.ReadFile(store.path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		store.Close()
+		return nil, fmt.Errorf("read state file: %w", err)
+	}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &store.state); err != nil {
+			store.Close()
+			return nil, fmt.Errorf("parse state file: %w", err)
+		}
+		if store.state.Version != stateVersion || store.state.Commands == nil {
+			store.Close()
+			return nil, fmt.Errorf("unsupported IssueShell state version %d", store.state.Version)
+		}
+	}
+	return store, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s.lockFile == nil {
+		return nil
+	}
+	err := syscall.Flock(int(s.lockFile.Fd()), syscall.LOCK_UN)
+	closeErr := s.lockFile.Close()
+	s.lockFile = nil
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
 
 // Begin records a command before execution. false means the command was already seen.
 func (s *Store) Begin(record Record) (bool, error) {
-	now := time.Now().UTC()
-	if record.StartedAt.IsZero() {
-		record.StartedAt = now
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := recordKey(record.Repo, record.Issue, record.CommandID)
+	if _, exists := s.state.Commands[key]; exists {
+		return false, nil
 	}
-	result, err := s.db.Exec(`
-		INSERT INTO commands (repo, issue_number, command_id, comment_id, status, output_path, started_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(repo, issue_number, command_id) DO NOTHING`,
-		record.Repo, record.Issue, record.CommandID, record.CommentID, StatusRunning,
-		record.OutputPath, record.StartedAt.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
-	if err != nil {
+	if record.StartedAt.IsZero() {
+		record.StartedAt = time.Now().UTC()
+	}
+	record.Status = StatusRunning
+	s.state.Commands[key] = record
+	if err := s.persist(); err != nil {
+		delete(s.state.Commands, key)
 		return false, err
 	}
-	rows, err := result.RowsAffected()
-	return rows == 1, err
+	return true, nil
 }
 
 func (s *Store) SetStatus(repo string, issue int, commandID, status string) error {
-	result, err := s.db.Exec(`
-		UPDATE commands SET status = ?, updated_at = ?
-		WHERE repo = ? AND issue_number = ? AND command_id = ?`,
-		status, time.Now().UTC().Format(time.RFC3339Nano), repo, issue, commandID)
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := recordKey(repo, issue, commandID)
+	record, exists := s.state.Commands[key]
+	if !exists {
 		return errors.New("command state not found")
+	}
+	previous := record
+	record.Status = status
+	s.state.Commands[key] = record
+	if err := s.persist(); err != nil {
+		s.state.Commands[key] = previous
+		return err
 	}
 	return nil
 }
 
 func (s *Store) Exists(repo string, issue int, commandID string) (bool, error) {
-	var one int
-	err := s.db.QueryRow(`
-		SELECT 1 FROM commands WHERE repo = ? AND issue_number = ? AND command_id = ?`,
-		repo, issue, commandID).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	return err == nil, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, exists := s.state.Commands[recordKey(repo, issue, commandID)]
+	return exists, nil
 }
 
 func (s *Store) Running(repo string, issue int) ([]Record, error) {
-	rows, err := s.db.Query(`
-		SELECT repo, issue_number, command_id, comment_id, status, output_path, started_at
-		FROM commands WHERE repo = ? AND issue_number = ? AND status = ?
-		ORDER BY started_at`, repo, issue, StatusRunning)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var records []Record
-	for rows.Next() {
-		var record Record
-		var started string
-		if err := rows.Scan(&record.Repo, &record.Issue, &record.CommandID, &record.CommentID, &record.Status, &record.OutputPath, &started); err != nil {
-			return nil, err
+	for _, record := range s.state.Commands {
+		if record.Repo == repo && record.Issue == issue && record.Status == StatusRunning {
+			records = append(records, record)
 		}
-		record.StartedAt, _ = time.Parse(time.RFC3339Nano, started)
-		records = append(records, record)
 	}
-	return records, rows.Err()
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].StartedAt.Before(records[j].StartedAt)
+	})
+	return records, nil
+}
+
+func (s *Store) persist() error {
+	data, err := json.MarshalIndent(s.state, "", "  ")
+	if err != nil {
+		return err
+	}
+	directory := filepath.Dir(s.path)
+	temporary, err := os.CreateTemp(directory, ".state-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, s.path); err != nil {
+		return err
+	}
+	directoryHandle, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	err = directoryHandle.Sync()
+	closeErr := directoryHandle.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+func recordKey(repo string, issue int, commandID string) string {
+	return repo + "\x00" + strconv.Itoa(issue) + "\x00" + commandID
 }

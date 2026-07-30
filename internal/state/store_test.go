@@ -6,11 +6,11 @@ import (
 )
 
 func TestStoreBeginAndRecover(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "state"))
+	directory := filepath.Join(t.TempDir(), "state")
+	store, err := Open(directory)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
 	record := Record{Repo: "owner/repo", Issue: 3, CommandID: "cmd", CommentID: 9, OutputPath: "/tmp/output"}
 	created, err := store.Begin(record)
 	if err != nil || !created {
@@ -30,5 +30,20 @@ func TestStoreBeginAndRecover(t *testing.T) {
 	running, err = store.Running(record.Repo, record.Issue)
 	if err != nil || len(running) != 0 {
 		t.Fatalf("Running() after completion = %#v, %v", running, err)
+	}
+	if _, err := Open(directory); err == nil {
+		t.Fatal("expected state directory lock error")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	exists, err := reopened.Exists(record.Repo, record.Issue, record.CommandID)
+	if err != nil || !exists {
+		t.Fatalf("persisted command exists = %v, %v", exists, err)
 	}
 }
