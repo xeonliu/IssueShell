@@ -1,0 +1,7 @@
+/bin/
+/issueshell-client
+/issueshell-server
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.issueshell/
