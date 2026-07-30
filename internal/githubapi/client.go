@@ -3,12 +3,14 @@ package githubapi
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -20,9 +22,10 @@ const defaultBaseURL = "https://api.github.com"
 var repositoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 
 type Client struct {
-	baseURL string
-	token   string
-	http    *http.Client
+	baseURL     string
+	token       string
+	http        *http.Client
+	insecureTLS bool
 }
 
 type Repository struct {
@@ -60,7 +63,27 @@ func (e *APIError) Error() string {
 }
 
 func New(token, baseURL string) (*Client, error) {
-	return NewWithHTTPClient(token, baseURL, &http.Client{Timeout: 30 * time.Second})
+	insecureTLS := false
+	if raw := os.Getenv("GITHUB_INSECURE_SKIP_VERIFY"); raw != "" {
+		var err error
+		insecureTLS, err = strconv.ParseBool(raw)
+		if err != nil {
+			return nil, errors.New("GITHUB_INSECURE_SKIP_VERIFY must be true or false")
+		}
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if insecureTLS {
+		transport.TLSClientConfig = &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true,
+		}
+	}
+	client, err := NewWithHTTPClient(token, baseURL, &http.Client{Transport: transport, Timeout: 30 * time.Second})
+	if err != nil {
+		return nil, err
+	}
+	client.insecureTLS = insecureTLS
+	return client, nil
 }
 
 // NewWithHTTPClient allows callers to supply transport policy or an in-memory test transport.
@@ -84,6 +107,8 @@ func NewWithHTTPClient(token, baseURL string, httpClient *http.Client) (*Client,
 		http:    httpClient,
 	}, nil
 }
+
+func (c *Client) InsecureTLS() bool { return c.insecureTLS }
 
 func ValidateRepo(repo string) error {
 	if !repositoryPattern.MatchString(repo) {

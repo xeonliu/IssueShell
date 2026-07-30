@@ -84,6 +84,28 @@ func TestAPIErrorDoesNotExposeToken(t *testing.T) {
 	}
 }
 
+func TestNewAllowsExplicitInsecureTLS(t *testing.T) {
+	t.Setenv("GITHUB_INSECURE_SKIP_VERIFY", "true")
+	client, err := New("secret", "https://github.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !client.InsecureTLS() {
+		t.Fatal("expected insecure TLS to be enabled")
+	}
+	transport, ok := client.http.Transport.(*http.Transport)
+	if !ok || transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("HTTP transport did not disable certificate verification")
+	}
+}
+
+func TestNewRejectsInvalidInsecureTLSValue(t *testing.T) {
+	t.Setenv("GITHUB_INSECURE_SKIP_VERIFY", "sometimes")
+	if _, err := New("secret", "https://github.test"); err == nil {
+		t.Fatal("expected invalid insecure TLS value to fail")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

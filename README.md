@@ -71,6 +71,31 @@ For GitHub Enterprise Server, point IssueShell and the verification request at t
 export GITHUB_API_URL='https://github.example.com/api/v3'
 ```
 
+### TLS interception and restricted networks
+
+If IssueShell reports `x509: certificate signed by unknown authority`, the network is usually intercepting TLS with a private CA, or GitHub Enterprise is using a private certificate. The preferred fix is to install that CA certificate into the operating system trust store.
+
+If installing the CA is not possible, certificate verification can be disabled explicitly on each affected machine:
+
+```sh
+export GITHUB_INSECURE_SKIP_VERIFY=true
+```
+
+Then run IssueShell normally:
+
+```sh
+issueshell-client run --issue 42
+issueshell-server send --issue 42 --command 'uname -a'
+```
+
+Both programs print a warning while insecure TLS is enabled. This setting allows a network intermediary to read the GitHub token, inspect results, and replace commands or responses. Use it only on a network you understand, never make it a project default, and disable it after leaving that environment:
+
+```sh
+unset GITHUB_INSECURE_SKIP_VERIFY
+```
+
+Only `true` or `false` should be used. Omitting the variable or setting it to `false` restores normal certificate and hostname verification.
+
 ## Start a session
 
 After configuring the repository and token on both machines, create the session from the server machine:

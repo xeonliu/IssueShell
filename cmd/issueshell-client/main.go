@@ -33,6 +33,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "issueshell-client:", err)
 		os.Exit(1)
 	}
+	if api.InsecureTLS() {
+		fmt.Fprintln(os.Stderr, "WARNING: TLS certificate verification is disabled; GitHub tokens and commands may be intercepted")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err = clientapp.Run(ctx, clientapp.Config{
