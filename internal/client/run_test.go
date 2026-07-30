@@ -88,6 +88,51 @@ func TestRunExecutesCommandUploadsResultAndStopsOnClose(t *testing.T) {
 	}
 }
 
+func TestRunStopsWhenServerPostsSessionClose(t *testing.T) {
+	sessionID := "test-session"
+	issueBody, err := protocol.Encode(protocol.Message{Kind: protocol.KindSession, SessionID: sessionID}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeBody, err := protocol.Encode(protocol.Message{Kind: protocol.KindSessionClose, SessionID: sessionID}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commentRequests := 0
+	handler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo":
+			_ = json.NewEncoder(response).Encode(githubapi.Repository{Private: true})
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/issues/10":
+			_ = json.NewEncoder(response).Encode(githubapi.Issue{Number: 10, State: "open", Body: issueBody})
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/issues/10/comments":
+			commentRequests++
+			comments := []githubapi.Comment(nil)
+			if commentRequests > 1 {
+				comments = []githubapi.Comment{{ID: 1, Body: closeBody}}
+			}
+			_ = json.NewEncoder(response).Encode(comments)
+		default:
+			http.Error(response, "unexpected request", http.StatusNotFound)
+		}
+	})
+	api, err := githubapi.NewWithHTTPClient("secret", "https://github.test", memoryHTTPClient(handler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := Run(ctx, Config{
+		API: api, Repo: "owner/repo", Issue: 10, Shell: "/bin/sh",
+		PollInterval: time.Millisecond, StateDir: t.TempDir(), Output: io.Discard, ErrorOutput: io.Discard,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if commentRequests != 2 {
+		t.Fatalf("comment requests = %d, want 2", commentRequests)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

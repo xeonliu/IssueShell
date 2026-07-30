@@ -124,6 +124,13 @@ func Run(ctx context.Context, config Config) error {
 			}
 			return err
 		}
+		if issue.State != "open" {
+			closing = true
+			if current != nil {
+				current.cancel()
+			}
+			continue
+		}
 		comments, err := config.API.ListComments(ctx, config.Repo, config.Issue)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -135,11 +142,12 @@ func Run(ctx context.Context, config Config) error {
 			}
 			return err
 		}
-		if issue.State != "open" || hasSessionClose(comments, sessionMessage.SessionID) {
+		if hasSessionClose(comments, sessionMessage.SessionID) {
 			closing = true
 			if current != nil {
 				current.cancel()
 			}
+			continue
 		}
 		if current != nil && hasCancel(comments, sessionMessage.SessionID, current.message.CommandID) {
 			current.cancel()

@@ -184,6 +184,66 @@ func TestSendInterruptCancelsInFlightPollAndPostsCancellation(t *testing.T) {
 	}
 }
 
+func TestClosePostsSessionCloseAndClosesIssue(t *testing.T) {
+	sessionID := "session-id"
+	issueBody, err := protocol.Encode(protocol.Message{Kind: protocol.KindSession, SessionID: sessionID}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var postedClose, closedIssue bool
+	handler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo":
+			_ = json.NewEncoder(response).Encode(githubapi.Repository{Private: true})
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/issues/10":
+			_ = json.NewEncoder(response).Encode(githubapi.Issue{Number: 10, State: "open", Body: issueBody})
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/repo/issues/10/comments":
+			_ = json.NewEncoder(response).Encode([]githubapi.Comment(nil))
+		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/repo/issues/10/comments":
+			var input struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				response.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			message, _, err := protocol.Decode(input.Body)
+			if err != nil {
+				t.Error(err)
+				response.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			postedClose = message.Kind == protocol.KindSessionClose && message.SessionID == sessionID
+			response.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(response).Encode(githubapi.Comment{ID: 1, Body: input.Body})
+		case request.Method == http.MethodPatch && request.URL.Path == "/repos/owner/repo/issues/10":
+			var input struct {
+				State string `json:"state"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Error(err)
+				response.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			closedIssue = input.State == "closed"
+			_ = json.NewEncoder(response).Encode(githubapi.Issue{Number: 10, State: input.State, Body: issueBody})
+		default:
+			http.Error(response, fmt.Sprintf("unexpected %s %s", request.Method, request.URL.String()), http.StatusNotFound)
+		}
+	})
+	api, err := githubapi.NewWithHTTPClient("secret", "https://github.test", memoryHTTPClient(handler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Close(context.Background(), api, "owner/repo", 10); err != nil {
+		t.Fatal(err)
+	}
+	if !postedClose || !closedIssue {
+		t.Fatalf("Close() posted session close = %v, closed issue = %v", postedClose, closedIssue)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
