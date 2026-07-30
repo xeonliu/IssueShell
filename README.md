@@ -29,18 +29,55 @@ go build -o bin/issueshell-server ./cmd/issueshell-server
 go build -o bin/issueshell-client ./cmd/issueshell-client
 ```
 
-## Start a session
+## Configure the GitHub token
 
-Set the repository and token on both machines:
+IssueShell requires a token on both the server and client because both sides read and write Issue comments. A fine-grained personal access token is recommended:
+
+1. Open GitHub **Settings** -> **Developer settings** -> **Personal access tokens** -> **Fine-grained tokens**.
+2. Select **Generate new token** and set an expiration date.
+3. Set **Resource owner** to the user or organization that owns the private repository.
+4. Under **Repository access**, choose **Only select repositories**, then select the IssueShell repository.
+5. Under **Repository permissions**, set **Issues** to **Read and write**. **Metadata** remains **Read-only** automatically.
+6. Generate the token and store it in a password manager or another secret store. GitHub shows it only once.
+
+No `Contents`, `Actions`, administration, or account-level permission is required. A classic token with the broad `repo` scope also works, but is not recommended.
+
+For an organization repository, the token may remain unusable until an organization administrator approves it. If the organization enforces SAML SSO, authorize the token for that organization as well.
+
+Set the token and repository in the environment on each machine that runs IssueShell:
 
 ```sh
 export GITHUB_TOKEN='github_pat_...'
 export ISSUESHELL_REPO='owner/private-repo'
 ```
 
-Create the session from the server machine:
+Avoid placing a real token in this repository, command arguments, Issue comments, screenshots, or shared shell history. IssueShell reads it only from `GITHUB_TOKEN`, so the server and client can use different tokens with access to the same repository.
+
+Verify the token before starting a session:
 
 ```sh
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "${GITHUB_API_URL:-https://api.github.com}/repos/$ISSUESHELL_REPO"
+```
+
+The expected response is `200`. `401` means the token is invalid or expired, `403` usually means approval/SSO or policy restrictions, and `404` usually means the repository name is wrong or the token was not granted access to that private repository.
+
+For GitHub Enterprise Server, point IssueShell and the verification request at the instance API URL:
+
+```sh
+export GITHUB_API_URL='https://github.example.com/api/v3'
+```
+
+## Start a session
+
+After configuring the repository and token on both machines, create the session from the server machine:
+
+```sh
+export GITHUB_TOKEN='github_pat_...'
+export ISSUESHELL_REPO='owner/private-repo'
 issueshell-server create
 # 42    https://github.com/owner/private-repo/issues/42
 ```
